@@ -70,15 +70,18 @@ mod cpupool {
 }
 
 mod thread_pool_callback {
-    use chocolates::thread_pool::callback::{Handle, RunnerFactory};
-    use chocolates::thread_pool::Config;
+    use chocolates::thread_pool::callback::{Handle, SimpleThreadPool, Task};
+    use chocolates::thread_pool::{Config, GlobalQueue};
     use criterion::Bencher;
     use std::sync::mpsc;
 
     pub fn chained_spawn(b: &mut Bencher) {
-        let pool = Config::new("chain-spawn").spawn(RunnerFactory::new());
+        let pool = SimpleThreadPool::from_config(Config::new("chain-spawn"));
 
-        fn spawn(c: &mut Handle<'_>, res_tx: mpsc::Sender<()>, n: usize) {
+        fn spawn<G>(c: &mut Handle<'_, G>, res_tx: mpsc::Sender<()>, n: usize)
+        where
+            G: GlobalQueue<Task = Task<G>>,
+        {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {
@@ -97,18 +100,22 @@ mod thread_pool_callback {
 }
 
 mod thread_pool_future {
-    use chocolates::thread_pool::future::{RunnerFactory, Sender};
-    use chocolates::thread_pool::Config;
+    use chocolates::thread_pool::future::{Sender, SimpleThreadPool, TaskUnit};
+    use chocolates::thread_pool::{Config, SchedUnit};
     use criterion::Bencher;
     use futures::future;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc};
 
     pub fn chained_spawn(b: &mut Bencher) {
-        let threadpool = Config::new("chained_spawn")
-            .max_idle_time(std::time::Duration::from_secs(3))
-            .spawn(RunnerFactory::new(4));
+        let mut config = Config::new("chained_spawn");
+        config.max_idle_time(std::time::Duration::from_secs(3));
+        let threadpool = SimpleThreadPool::from_config(config);
 
-        fn spawn(pool_tx: Sender, res_tx: mpsc::Sender<()>, n: usize) {
+        fn spawn(
+            pool_tx: Sender<crossbeam_deque::Injector<SchedUnit<Arc<TaskUnit>>>>,
+            res_tx: mpsc::Sender<()>,
+            n: usize,
+        ) {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {
@@ -127,7 +134,6 @@ mod thread_pool_future {
             res_rx.recv().unwrap();
         });
     }
-
 }
 
 fn chained_spawn(b: &mut Criterion) {

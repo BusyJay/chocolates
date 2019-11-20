@@ -1,92 +1,128 @@
-use super::PoolContext;
+use super::{Config, GlobalQueue, PoolContext, SchedUnit};
+use crate::thread_pool::global_queue::multi_level;
 use futures::executor::{self, Notify, Spawn};
 use futures::future::{ExecuteError, Executor};
 use futures::sync::oneshot;
 use futures::{Async, Future};
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::{mem, ptr};
 
 pub use futures::sync::oneshot::SpawnHandle;
 
-pub struct Runner {
+pub struct Runner<G>
+where
+    G: GlobalQueue,
+{
     max_inplace_spin: usize,
-    notifier: Option<Arc<ThreadPoolNotify>>,
+    notifier: Option<Arc<ThreadPoolNotify<G>>>,
+    _phantom: PhantomData<G>,
 }
 
-pub struct RunnerFactory {
+pub struct RunnerFactory<G>
+where
+    G: GlobalQueue,
+{
     max_inplace_spin: usize,
+    _phantom: PhantomData<G>,
 }
 
-impl RunnerFactory {
-    pub fn new(max_inplace_spin: usize) -> RunnerFactory {
-        RunnerFactory { max_inplace_spin }
-    }
-}
-
-impl Default for RunnerFactory {
-    fn default() -> RunnerFactory {
+impl<G> RunnerFactory<G>
+where
+    G: GlobalQueue,
+{
+    pub fn new(max_inplace_spin: usize) -> Self {
         RunnerFactory {
-            max_inplace_spin: 4,
+            max_inplace_spin,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl super::RunnerFactory for RunnerFactory {
-    type Runner = Runner;
+impl<G> Default for RunnerFactory<G>
+where
+    G: GlobalQueue,
+{
+    fn default() -> Self {
+        Self {
+            max_inplace_spin: 4,
+            _phantom: PhantomData,
+        }
+    }
+}
 
-    fn produce(&mut self) -> Runner {
+impl<G, T> super::RunnerFactory for RunnerFactory<G>
+where
+    G: GlobalQueue<Task = Arc<T>> + Send + Sync + 'static,
+    T: FutureTask,
+{
+    type Runner = Runner<G>;
+
+    fn produce(&mut self) -> Runner<G> {
         Runner {
             max_inplace_spin: self.max_inplace_spin,
             notifier: None,
+            _phantom: PhantomData,
         }
     }
 }
 
 thread_local! {
-    static LOCAL_WAKER: UnsafeCell<*mut PoolContext<Arc<TaskUnit>>> = UnsafeCell::new(ptr::null_mut());
+    static LOCAL_WAKER: UnsafeCell<*mut ()> = UnsafeCell::new(ptr::null_mut());
 }
 
-#[derive(Clone)]
-pub struct Sender {
-    remote: super::Remote<Arc<TaskUnit>>,
+pub struct Sender<G>
+where
+    G: GlobalQueue,
+{
+    remote: super::Remote<G>,
 }
 
-impl Sender {
-    pub fn spawn(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
-        self.spawn_task(Arc::new(TaskUnit::new(f)))
-    }
-
-    pub fn spawn_handle<F>(&self, f: F) -> SpawnHandle<F::Item, F::Error>
-    where
-        F: Future + Send + 'static,
-        F::Item: Send,
-        F::Error: Send,
-    {
-        oneshot::spawn(f, self)
-    }
-
-    fn spawn_task(&self, task: Arc<TaskUnit>) {
+impl<G, T> Sender<G>
+where
+    G: GlobalQueue<Task = Arc<T>> + Send + Sync + 'static,
+    T: FutureTask,
+{
+    fn spawn_task(&self, task: Arc<T>) {
         LOCAL_WAKER.with(|w| {
             let ptr = unsafe { *w.get() };
             if ptr.is_null() {
                 self.remote.spawn(task)
             } else {
-                unsafe { &mut *ptr }.spawn(task)
+                unsafe { (*(ptr as *mut PoolContext<G>)).spawn(task) }
             }
         })
     }
 }
 
-pub struct ThreadPoolNotify {
-    sender: Sender,
+impl<G> Clone for Sender<G>
+where
+    G: GlobalQueue,
+{
+    fn clone(&self) -> Self {
+        Sender {
+            remote: self.remote.clone(),
+        }
+    }
 }
 
-impl Notify for ThreadPoolNotify {
+pub struct ThreadPoolNotify<G>
+where
+    G: GlobalQueue,
+{
+    sender: Sender<G>,
+}
+
+impl<G, T> Notify for ThreadPoolNotify<G>
+where
+    G: GlobalQueue<Task = Arc<T>> + Send + Sync + 'static,
+    T: FutureTask,
+{
     fn notify(&self, id: usize) {
-        let task = unsafe { Arc::from_raw(id as *mut TaskUnit) };
-        if !task.mark_scheduled() {
+        let task = unsafe { Arc::from_raw(id as *mut T) };
+        if !task.as_task_unit().mark_scheduled() {
             mem::forget(task);
             return;
         }
@@ -96,14 +132,14 @@ impl Notify for ThreadPoolNotify {
     }
 
     fn clone_id(&self, id: usize) -> usize {
-        let task = unsafe { Arc::from_raw(id as *mut TaskUnit) };
+        let task = unsafe { Arc::from_raw(id as *mut T) };
         let t = task.clone();
         mem::forget(task);
         Arc::into_raw(t) as usize
     }
 
     fn drop_id(&self, id: usize) {
-        unsafe { Arc::from_raw(id as *mut TaskUnit) };
+        unsafe { Arc::from_raw(id as *mut T) };
     }
 }
 
@@ -123,30 +159,6 @@ impl TaskUnit {
         TaskUnit {
             state: AtomicU8::new(SCHEDULED),
             task: UnsafeCell::new(Some(executor::spawn(Box::new(f)))),
-        }
-    }
-}
-
-pub type FutureThreadPool = super::ThreadPool<Arc<TaskUnit>>;
-
-impl FutureThreadPool {
-    pub fn spawn_future<F: Future<Item = (), Error = ()> + Send + 'static>(&self, f: F) {
-        let t = Arc::new(TaskUnit::new(f));
-        self.spawn(t);
-    }
-
-    pub fn spawn_future_handle<F>(&self, f: F) -> SpawnHandle<F::Item, F::Error>
-    where
-        F: Future + Send + 'static,
-        F::Item: Send,
-        F::Error: Send,
-    {
-        oneshot::spawn(f, self)
-    }
-
-    pub fn sender(&self) -> Sender {
-        Sender {
-            remote: self.remote(),
         }
     }
 }
@@ -201,14 +213,34 @@ impl TaskUnit {
     }
 }
 
-impl super::Runner for Runner {
-    type Task = Arc<TaskUnit>;
+pub trait FutureTask: Send + Sync {
+    fn as_task_unit(&self) -> &TaskUnit;
+}
 
-    fn start(&mut self, ctx: &mut PoolContext<Self::Task>) {
+impl FutureTask for TaskUnit {
+    fn as_task_unit(&self) -> &TaskUnit {
+        self
+    }
+}
+
+impl FutureTask for multi_level::MultiLevelTask<TaskUnit> {
+    fn as_task_unit(&self) -> &TaskUnit {
+        &self.task
+    }
+}
+
+impl<G, T> super::Runner for Runner<G>
+where
+    G: GlobalQueue<Task = Arc<T>> + Send + Sync + 'static,
+    T: FutureTask,
+{
+    type GlobalQueue = G;
+
+    fn start(&mut self, ctx: &mut PoolContext<G>) {
         LOCAL_WAKER.with(|w| {
             let waker = unsafe { &mut *w.get() };
             assert!((*waker).is_null());
-            *waker = ctx;
+            *waker = ctx as *mut _ as *mut ();
         });
         self.notifier = Some(Arc::new(ThreadPoolNotify {
             sender: Sender {
@@ -217,17 +249,18 @@ impl super::Runner for Runner {
         }));
     }
 
-    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) -> bool {
+    fn handle(&mut self, ctx: &mut PoolContext<G>, task: Arc<T>) -> bool {
         let mut tried_times = 1;
-        let id = &*task as *const TaskUnit as usize;
-        let spawn = unsafe { &mut *task.task.get() }.as_mut().unwrap();
+        let id = &*task as *const T as usize;
+        let task_unit = task.as_task_unit();
+        let spawn = unsafe { &mut *task_unit.task.get() }.as_mut().unwrap();
         let notifier = self.notifier.as_ref().unwrap();
         loop {
-            task.mark_polling();
+            task_unit.mark_polling();
             let res = spawn.poll_future_notify(notifier, id);
             match res {
                 Ok(Async::NotReady) => {
-                    if task.mark_idle() {
+                    if task_unit.mark_idle() {
                         return false;
                     } else {
                         if tried_times >= self.max_inplace_spin {
@@ -239,14 +272,14 @@ impl super::Runner for Runner {
                     }
                 }
                 Ok(Async::Ready(())) | Err(()) => {
-                    task.on_completed();
+                    task_unit.on_completed();
                     return true;
                 }
             }
         }
     }
 
-    fn end(&mut self, _: &PoolContext<Self::Task>) {
+    fn end(&mut self, _: &PoolContext<G>) {
         LOCAL_WAKER.with(|w| {
             let waker = unsafe { &mut *w.get() };
             assert!(!(*waker).is_null());
@@ -256,7 +289,62 @@ impl super::Runner for Runner {
     }
 }
 
-impl<F> Executor<F> for Sender
+pub struct SimpleThreadPool(super::ThreadPool<crossbeam_deque::Injector<SchedUnit<Arc<TaskUnit>>>>);
+
+impl SimpleThreadPool {
+    pub fn from_config(config: Config) -> Self {
+        let pool = config.spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
+        Self(pool)
+    }
+
+    pub fn spawn_future<F: Future<Item = (), Error = ()> + Send + 'static>(&self, f: F) {
+        let t = Arc::new(TaskUnit::new(f));
+        self.0.spawn(t);
+    }
+
+    pub fn spawn_future_handle<F>(&self, f: F) -> SpawnHandle<F::Item, F::Error>
+    where
+        F: Future + Send + 'static,
+        F::Item: Send,
+        F::Error: Send,
+    {
+        oneshot::spawn(f, self)
+    }
+
+    pub fn sender(&self) -> Sender<crossbeam_deque::Injector<SchedUnit<Arc<TaskUnit>>>> {
+        Sender {
+            remote: self.0.remote(),
+        }
+    }
+}
+
+impl Sender<crossbeam_deque::Injector<SchedUnit<Arc<TaskUnit>>>> {
+    pub fn spawn(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
+        self.spawn_task(Arc::new(TaskUnit::new(f)))
+    }
+
+    pub fn spawn_handle<F>(&self, f: F) -> SpawnHandle<F::Item, F::Error>
+    where
+        F: Future + Send + 'static,
+        F::Item: Send,
+        F::Error: Send,
+    {
+        oneshot::spawn(f, self)
+    }
+}
+
+impl<F> Executor<F> for SimpleThreadPool
+where
+    F: Future<Item = (), Error = ()> + Send + 'static,
+{
+    fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
+        self.spawn_future(future);
+        // TODO: handle shutdown here.
+        Ok(())
+    }
+}
+
+impl<F> Executor<F> for Sender<crossbeam_deque::Injector<SchedUnit<Arc<TaskUnit>>>>
 where
     F: Future<Item = (), Error = ()> + Send + 'static,
 {
@@ -267,13 +355,40 @@ where
     }
 }
 
-impl<F> Executor<F> for FutureThreadPool
-where
-    F: Future<Item = (), Error = ()> + Send + 'static,
-{
-    fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
-        self.spawn_future(future);
-        // TODO: handle shutdown here.
-        Ok(())
+pub struct MultiLevelThreadPool(
+    super::ThreadPool<
+        multi_level::MultiLevelQueue<TaskUnit, Arc<multi_level::MultiLevelTask<TaskUnit>>>,
+    >,
+);
+
+impl MultiLevelThreadPool {
+    pub fn from_config(config: Config) -> Self {
+        let pool = config.spawn(RunnerFactory::new(4), || {
+            multi_level::MultiLevelQueue::new()
+        });
+        Self(pool)
+    }
+
+    pub fn spawn_future<F: Future<Item = (), Error = ()> + Send + 'static>(
+        &self,
+        f: F,
+        task_id: u64,
+        fixed_level: Option<u8>,
+    ) {
+        let task = TaskUnit::new(f);
+        let t = Arc::new(
+            self.0
+                .global_queue()
+                .create_task(task, task_id, fixed_level),
+        );
+        self.0.spawn(t);
+    }
+
+    pub fn async_adjust_level_ratio(&self) -> impl std::future::Future<Output = ()> {
+        self.0.global_queue().async_adjust_level_ratio()
+    }
+
+    pub fn async_cleanup_stats(&self) -> impl std::future::Future<Output = ()> {
+        self.0.global_queue().async_cleanup_stats()
     }
 }
